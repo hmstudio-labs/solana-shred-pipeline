@@ -13,7 +13,10 @@ use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, RecvError};
 use dashmap::DashMap;
 use itertools::Itertools;
-use jito_protos::shredstream::{Entry as PbEntry, TraceShred};
+use jito_protos::{
+    shredstream::{Entry as PbEntry, TraceShred},
+    filtered::TxData,
+};
 use log::{debug, error, info, warn};
 use prost::Message;
 use solana_client::client_error::reqwest;
@@ -60,6 +63,7 @@ pub fn start_forwarder_threads(
     metrics: Arc<ShredMetrics>,
     shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
+    filtered_tx_sender: Option<Arc<Sender<TxData>>>,
 ) -> Vec<JoinHandle<()>> {
     let num_threads = num_threads
         .unwrap_or_else(|| usize::from(std::thread::available_parallelism().unwrap()).min(4));
@@ -103,6 +107,7 @@ pub fn start_forwarder_threads(
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(pkt_batch) => {
+                            let sender_ref = filtered_tx_sender.as_ref().map(|s| s.as_ref());
                             deshred::reconstruct_shreds(
                                 pkt_batch,
                                 &mut all_shreds,
@@ -111,6 +116,7 @@ pub fn start_forwarder_threads(
                                 &mut highest_slot_seen,
                                 &rs_cache,
                                 &metrics,
+                                &sender_ref,
                             );
 
                             deshredded_entries.drain(..).for_each(

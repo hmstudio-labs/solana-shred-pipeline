@@ -27,7 +27,10 @@ use solana_perf::deduper::Deduper;
 use solana_sdk::{clock::Slot, signature::read_keypair_file};
 use solana_streamer::streamer::StreamerReceiveStats;
 use thiserror::Error;
-use tokio::{runtime::Runtime, sync::broadcast::Sender as BroadcastSender};
+use tokio::{
+    runtime::Runtime,
+    sync::broadcast::Sender as BroadcastSender,
+};
 use tonic::Status;
 
 use crate::{
@@ -232,11 +235,11 @@ fn main() -> Result<(), ShredstreamProxyError> {
     {
         return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "Invalid arguments provided, dynamic endpoints requires both --endpoint-discovery-url and --discovered-endpoints-port.")));
     }
-    if args.endpoint_discovery_url.is_none()
-        && args.discovered_endpoints_port.is_none()
-        && args.dest_ip_ports.is_empty()
-    {
-        return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "No destinations found. You must provide values for --dest-ip-ports or --endpoint-discovery-url.")));
+    // Allow running without destinations if grpc-service-port is set (gRPC-only mode)
+    let has_destinations = !args.dest_ip_ports.is_empty() || args.endpoint_discovery_url.is_some();
+    let grpc_only_mode = !has_destinations && args.grpc_service_port.is_some();
+    if !has_destinations && args.grpc_service_port.is_none() {
+        return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "No destinations found. You must provide values for --dest-ip-ports, --endpoint-discovery-url, or --grpc-service-port.")));
     }
 
     let exit = Arc::new(AtomicBool::new(false));
@@ -271,14 +274,6 @@ fn main() -> Result<(), ShredstreamProxyError> {
         thread_handles.push(heartbeat_hdl);
     }
 
-    // share sockets between refresh and forwarder thread
-    let unioned_dest_sockets = Arc::new(ArcSwap::from_pointee(
-        args.dest_ip_ports
-            .iter()
-            .map(|x| x.0)
-            .collect::<Vec<SocketAddr>>(),
-    ));
-
     // share deduper + metrics between forwarder <-> accessory thread
     // use mutex since metrics are write heavy. cheaper than rwlock
     let deduper = Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
@@ -287,43 +282,79 @@ fn main() -> Result<(), ShredstreamProxyError> {
     )));
 
     let entry_sender = Arc::new(BroadcastSender::new(100));
-    let forward_stats = Arc::new(StreamerReceiveStats::new("shredstream_proxy-listen_thread"));
-    let use_discovery_service =
-        args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
-    let maybe_multicast_socket = create_multicast_socket_on_device(
-        &args.multicast_device,
-        args.multicast_subscribe_port,
-        args.multicast_bind_ip,
-    )
-    .inspect(|mcast_socket| info!("Multicast listeners found: {mcast_socket:?}."));
-    let forwarder_hdls = forwarder::start_forwarder_threads(
-        unioned_dest_sockets.clone(),
-        args.src_bind_addr,
-        args.src_bind_port,
-        maybe_multicast_socket,
-        args.num_threads,
-        deduper.clone(),
-        args.grpc_service_port.is_some(),
-        entry_sender.clone(),
-        args.debug_trace_shred,
-        use_discovery_service,
-        forward_stats.clone(),
-        metrics.clone(),
-        shutdown_receiver.clone(),
-        exit.clone(),
-    );
-    thread_handles.extend(forwarder_hdls);
 
-    let report_metrics_thread = {
-        let exit = exit.clone();
-        spawn(move || {
-            while !exit.load(Ordering::Relaxed) {
-                sleep(Duration::from_secs(1));
-                forward_stats.report();
-            }
-        })
-    };
-    thread_handles.push(report_metrics_thread);
+    // Create filtered transaction sender (for gRPC streaming)
+    let filtered_tx_sender: Option<Arc<tokio::sync::broadcast::Sender<jito_protos::filtered::TxData>>> =
+        args.grpc_service_port.map(|_| Arc::new(BroadcastSender::new(100)));
+
+    if grpc_only_mode {
+        info!("Running in gRPC-only mode: receiving shreds and serving via gRPC, no UDP forwarding");
+    } else {
+        // share sockets between refresh and forwarder thread
+        let unioned_dest_sockets = Arc::new(ArcSwap::from_pointee(
+            args.dest_ip_ports
+                .iter()
+                .map(|x| x.0)
+                .collect::<Vec<SocketAddr>>(),
+        ));
+
+        let forward_stats = Arc::new(StreamerReceiveStats::new("shredstream_proxy-listen_thread"));
+        let use_discovery_service =
+            args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
+        let maybe_multicast_socket = create_multicast_socket_on_device(
+            &args.multicast_device,
+            args.multicast_subscribe_port,
+            args.multicast_bind_ip,
+        )
+        .inspect(|mcast_socket| info!("Multicast listeners found: {mcast_socket:?}."));
+        let forwarder_hdls = forwarder::start_forwarder_threads(
+            unioned_dest_sockets.clone(),
+            args.src_bind_addr,
+            args.src_bind_port,
+            maybe_multicast_socket,
+            args.num_threads,
+            deduper.clone(),
+            args.grpc_service_port.is_some(),
+            entry_sender.clone(),
+            args.debug_trace_shred,
+            use_discovery_service,
+            forward_stats.clone(),
+            metrics.clone(),
+            shutdown_receiver.clone(),
+            exit.clone(),
+            filtered_tx_sender.clone(),
+        );
+        thread_handles.extend(forwarder_hdls);
+
+        let report_metrics_thread = {
+            let exit = exit.clone();
+            spawn(move || {
+                while !exit.load(Ordering::Relaxed) {
+                    sleep(Duration::from_secs(1));
+                    forward_stats.report();
+                }
+            })
+        };
+        thread_handles.push(report_metrics_thread);
+
+        if use_discovery_service {
+            let unioned_dest_sockets = Arc::new(ArcSwap::from_pointee(
+                args.dest_ip_ports
+                    .iter()
+                    .map(|x| x.0)
+                    .collect::<Vec<SocketAddr>>(),
+            ));
+            let refresh_handle = forwarder::start_destination_refresh_thread(
+                args.endpoint_discovery_url.unwrap(),
+                args.discovered_endpoints_port.unwrap(),
+                args.dest_ip_ports,
+                unioned_dest_sockets,
+                shutdown_receiver.clone(),
+                exit.clone(),
+            );
+            thread_handles.push(refresh_handle);
+        }
+    }
 
     let metrics_hdl = forwarder::start_forwarder_accessory_thread(
         deduper,
@@ -333,22 +364,13 @@ fn main() -> Result<(), ShredstreamProxyError> {
         exit.clone(),
     );
     thread_handles.push(metrics_hdl);
-    if use_discovery_service {
-        let refresh_handle = forwarder::start_destination_refresh_thread(
-            args.endpoint_discovery_url.unwrap(),
-            args.discovered_endpoints_port.unwrap(),
-            args.dest_ip_ports,
-            unioned_dest_sockets,
-            shutdown_receiver.clone(),
-            exit.clone(),
-        );
-        thread_handles.push(refresh_handle);
-    }
 
     if let Some(port) = args.grpc_service_port {
+        let filtered_sender = filtered_tx_sender.as_ref().expect("filtered_tx_sender should exist when grpc_service_port is set");
         let server_hdl = server::start_server_thread(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
             entry_sender.clone(),
+            filtered_sender.clone(),
             exit.clone(),
             shutdown_receiver.clone(),
         );

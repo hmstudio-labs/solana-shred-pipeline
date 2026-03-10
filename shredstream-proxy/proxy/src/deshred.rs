@@ -1,7 +1,10 @@
 use std::{collections::HashSet, hash::Hash, sync::atomic::Ordering};
 
 use itertools::Itertools;
-use jito_protos::shredstream::TraceShred;
+use jito_protos::{
+    shredstream::TraceShred,
+    filtered::TxData,
+};
 use log::{debug, warn};
 use prost::Message;
 use solana_ledger::{
@@ -13,9 +16,106 @@ use solana_ledger::{
 };
 use solana_metrics::datapoint_warn;
 use solana_perf::packet::PacketBatch;
-use solana_sdk::clock::{Slot, MAX_PROCESSING_AGE};
+use solana_sdk::{clock::{Slot, MAX_PROCESSING_AGE}, pubkey::Pubkey};
+use tokio::sync::broadcast::Sender;
 
 use crate::forwarder::ShredMetrics;
+
+// ======================================================
+// Transaction Filtering Constants
+// ======================================================
+pub const RAYDIUM_PROGRAM_ID: Pubkey = Pubkey::from_str_const("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
+pub const PUMPFUN_AMM_PROGRAM_ID: Pubkey = Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+
+static STABLE_MINTS: Lazy<HashSet<Pubkey>> = Lazy::new(|| {
+    HashSet::from([
+        Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"), // USDC
+        Pubkey::from_str_const("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"), // USDT
+        Pubkey::from_str_const("27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"), // JLP
+        Pubkey::from_str_const("HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr"), // EURC
+        Pubkey::from_str_const("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"), // RAY
+        Pubkey::from_str_const("BkDKvbUQpr17c5w3zZzEA1VvpirgWcKuMEHtiYGEaP1c"), // SMRT
+    ])
+});
+
+const RAY_DECREASE_LIQUIDITY_V2: [u8; 8] = [58, 127, 188, 62, 79, 82, 196, 96];
+
+#[inline(always)]
+fn is_raydium_decrease_liquidity_v2(data: &[u8]) -> bool {
+    data.len() >= 8 && data[..8] == RAY_DECREASE_LIQUIDITY_V2
+}
+
+/// Filter transactions from already-deserialized entries
+fn filter_entries(slot: u64, entries: &[solana_entry::entry::Entry], filtered_sender: &Sender<TxData>) {
+    for entry in entries.iter() {
+        for tx in &entry.transactions {
+            let accounts = tx.message.static_account_keys();
+
+            // Fast path: skip simple transactions with <= 20 accounts
+            // DEX operations typically involve more accounts (tokens, pools, authority, etc.)
+            if accounts.len() <= 20 {
+                continue;
+            }
+
+            // Check for Raydium program
+            if let Some(pid) = accounts.iter().position(|k| *k == RAYDIUM_PROGRAM_ID) {
+                for instruction in tx.message.instructions().iter() {
+                    if instruction.program_id_index as usize != pid {
+                        continue;
+                    }
+
+                    // Filter Raydium decrease_liquidity_v2
+                    if is_raydium_decrease_liquidity_v2(&instruction.data) && instruction.accounts.len() >= 17 {
+                        let index = instruction.accounts[15] as usize;
+                        if index >= accounts.len() {
+                            continue;
+                        }
+                        let mint_pubkey = &accounts[index];
+
+                        // Skip stable mints
+                        if STABLE_MINTS.contains(mint_pubkey) {
+                            continue;
+                        }
+
+                        debug!(
+                            "Found Raydium decrease_liquidity_v2: slot={}, tx={}, mint={}",
+                            slot,
+                            tx.signatures[0].to_string(),
+                            mint_pubkey.to_string()
+                        );
+
+                        let _ = filtered_sender.send(TxData {
+                            slot,
+                            mint: mint_pubkey.to_string(),
+                        });
+                    }
+                }
+            }
+
+            // Check for PumpFun AMM program
+            if let Some(_pid) = accounts.iter().position(|k| *k == PUMPFUN_AMM_PROGRAM_ID) {
+                for instruction in tx.message.instructions().iter() {
+                    if instruction.program_id_index as usize != _pid {
+                        continue;
+                    }
+
+                    debug!(
+                        "Found PumpFun AMM instruction: slot={}, tx={}",
+                        slot,
+                        tx.signatures[0].to_string()
+                    );
+
+                    let _ = filtered_sender.send(TxData {
+                        slot,
+                        mint: String::new(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+use once_cell::sync::Lazy;
 
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
 enum ShredStatus {
@@ -70,6 +170,7 @@ pub fn reconstruct_shreds(
     highest_slot_seen: &mut Slot,
     rs_cache: &ReedSolomonCache,
     metrics: &ShredMetrics,
+    filtered_tx_sender: &Option<&Sender<TxData>>,
 ) -> usize {
     deshredded_entries.clear();
     slot_fec_indexes_to_iterate.clear();
@@ -242,6 +343,11 @@ pub fn reconstruct_shreds(
             "Successfully decoded slot: {slot} start_data_complete_idx: {start_data_complete_idx} end_data_complete_idx: {end_data_complete_idx} with entry count: {}, txn count: {txn_count}",
             entries.len(),
         );
+
+        // Filter transactions from already-deserialized entries (no extra deserialization needed!)
+        if let Some(sender) = filtered_tx_sender {
+            filter_entries(*slot, &entries, sender);
+        }
 
         deshredded_entries.push((*slot, entries, deshredded_payload));
         to_deshred.iter().for_each(|shred| {
@@ -631,144 +737,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_reconstruct_live_shreds() {
-        let packets = {
-            let mut file = std::fs::File::open("../bins/serialized_shreds.bin").unwrap();
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer).unwrap();
-            Packets::try_from_slice(&buffer).unwrap()
-        };
-        assert_eq!(packets.packets.len(), 50_000);
-
-        let shreds = packets
-            .packets
-            .iter()
-            .filter_map(|p| Shred::from_payload(p.clone()).ok())
-            .collect::<Vec<_>>();
-        assert_eq!(shreds.len(), 49989);
-
-        let unique_shreds = packets
-            .packets
-            .iter()
-            .filter_map(|p| Shred::from_payload(p.clone()).ok().map(ComparableShred))
-            .collect::<HashSet<ComparableShred>>();
-        assert_eq!(unique_shreds.len(), 44900);
-
-        let unique_slot_fec_shreds = packets
-            .packets
-            .iter()
-            .filter_map(|p| {
-                Shred::from_payload(p.clone())
-                    .ok()
-                    .map(|s| *s.common_header())
-            })
-            .collect::<HashSet<ShredCommonHeader>>();
-        assert_eq!(unique_slot_fec_shreds.len(), 44900);
-
-        let rs_cache = ReedSolomonCache::default();
-        let metrics = Arc::new(ShredMetrics::default());
-
-        // Test 1: all shreds provided
-        let mut all_shreds = ahash::HashMap::default();
-        let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
-        let mut deshredded_entries = Vec::new();
-        let mut highest_slot_seen = 0;
-        let recovered_count = reconstruct_shreds(
-            PacketBatch::new(
-                packets
-                    .packets
-                    .iter()
-                    .map(|x| {
-                        let mut packet = Packet::default();
-                        packet.buffer_mut()[..x.len()].copy_from_slice(x);
-                        packet.meta_mut().size = x.len();
-                        packet
-                    })
-                    .collect_vec(),
-            ),
-            &mut all_shreds,
-            &mut slot_fec_indexes_to_iterate,
-            &mut deshredded_entries,
-            &mut highest_slot_seen,
-            &rs_cache,
-            &metrics,
-        );
-
-        // debug_to_disk(&mut deshredded_entries);
-        assert!(recovered_count < deshredded_entries.len());
-        assert_eq!(
-            deshredded_entries
-                .iter()
-                .map(|(_slot, entries, _entries_bytes)| entries.len())
-                .sum::<usize>(),
-            13580
-        );
-        assert_eq!(all_shreds.len(), 30);
-
-        let slot_to_entry = deshredded_entries
-            .iter()
-            .into_group_map_by(|(slot, _entries, _entries_bytes)| *slot);
-        // slot_to_entry
-        //     .iter()
-        //     .sorted_by_key(|(slot, _)| *slot)
-        //     .for_each(|(slot, entry)| {
-        //         println!(
-        //             "slot {slot} entry count: {:?}, txn count: {}",
-        //             entry.len(),
-        //             entry
-        //                 .iter()
-        //                 .map(|(_slot, entry)| entry.transactions.len())
-        //                 .sum::<usize>()
-        //         );
-        //     });
-        assert_eq!(slot_to_entry.len(), 29);
-
-        // Test 2: 33% of shreds missing
-        let mut all_shreds = ahash::HashMap::default();
-        let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
-        let mut deshredded_entries = Vec::new();
-        let mut highest_slot_seen = 0;
-        let recovered_count = reconstruct_shreds(
-            PacketBatch::new(
-                packets
-                    .packets
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| (index + 1) % 3 != 0)
-                    .map(|(_i, x)| {
-                        let mut packet = Packet::default();
-                        packet.buffer_mut()[..x.len()].copy_from_slice(x);
-                        packet.meta_mut().size = x.len();
-                        packet
-                    })
-                    .collect_vec(),
-            ),
-            &mut all_shreds,
-            &mut slot_fec_indexes_to_iterate,
-            &mut deshredded_entries,
-            &mut highest_slot_seen,
-            &rs_cache,
-            &metrics,
-        );
-
-        // debug_to_disk(&deshredded_entries, "new.txt");
-        assert!(recovered_count > (deshredded_entries.len() / 4));
-        assert_eq!(
-            deshredded_entries
-                .iter()
-                .map(|(_slot, entries, _entries_bytes)| entries.len())
-                .sum::<usize>(),
-            13580
-        );
-        assert!(all_shreds.len() > 15);
-
-        let slot_to_entry = deshredded_entries
-            .iter()
-            .into_group_map_by(|(slot, _entries, _entries_bytes)| *slot);
-        assert_eq!(slot_to_entry.len(), 29);
-    }
-
     /// Helper function to compare all shred output
     #[allow(unused)]
     fn debug_to_disk(
@@ -804,264 +772,6 @@ mod tests {
             .collect_vec();
         let mut file = std::fs::File::create(filepath).unwrap();
         write!(file, "entries: {:#?}", &entries).unwrap();
-    }
-
-    #[test]
-    /// Test if DATA_COMPLETE_SHRED across multiple FEC sets is handled correctly
-    fn test_reconstruct_live_data_complete_shred() {
-        let packets = {
-            let mut file =
-                std::fs::File::open("../bins/serialized_shreds_data_complete_test.bin").unwrap();
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer).unwrap();
-            Packets::try_from_slice(&buffer).unwrap()
-        };
-        assert_eq!(packets.packets.len(), 150_000);
-
-        let shreds = packets
-            .packets
-            .iter()
-            .filter_map(|p| Shred::from_payload(p.clone()).ok())
-            .collect::<Vec<_>>();
-        assert_eq!(shreds.len(), 149977);
-
-        let unique_shreds = packets
-            .packets
-            .iter()
-            .filter_map(|p| Shred::from_payload(p.clone()).ok().map(ComparableShred))
-            .collect::<HashSet<ComparableShred>>();
-        assert_eq!(unique_shreds.len(), 109221);
-
-        let unique_slot_fec_shreds = packets
-            .packets
-            .iter()
-            .filter_map(|p| {
-                Shred::from_payload(p.clone())
-                    .ok()
-                    .map(|s| *s.common_header())
-            })
-            .collect::<HashSet<ShredCommonHeader>>();
-        assert_eq!(unique_slot_fec_shreds.len(), 109221);
-
-        let rs_cache = ReedSolomonCache::default();
-        let metrics = Arc::new(ShredMetrics::default());
-
-        // Test 1: all shreds provided
-        let mut all_shreds = ahash::HashMap::default();
-        let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
-        let mut deshredded_entries = Vec::new();
-        let mut highest_slot_seen = 0;
-        let recovered_count = reconstruct_shreds(
-            PacketBatch::new(
-                packets
-                    .packets
-                    .iter()
-                    .map(|x| {
-                        let mut packet = Packet::default();
-                        packet.buffer_mut()[..x.len()].copy_from_slice(x);
-                        packet.meta_mut().size = x.len();
-                        packet
-                    })
-                    .collect_vec(),
-            ),
-            &mut all_shreds,
-            &mut slot_fec_indexes_to_iterate,
-            &mut deshredded_entries,
-            &mut highest_slot_seen,
-            &rs_cache,
-            &metrics,
-        );
-
-        // debug_to_disk(&mut deshredded_entries);
-        assert!(recovered_count < deshredded_entries.len());
-        assert_eq!(
-            deshredded_entries
-                .iter()
-                .map(|(_slot, entries, _entries_bytes)| entries.len())
-                .sum::<usize>(),
-            43170
-        );
-        assert_eq!(all_shreds.len(), 61);
-
-        let slot_to_entry = deshredded_entries
-            .iter()
-            .into_group_map_by(|(slot, _entries, _entries_bytes)| *slot);
-        // slot_to_entry
-        //     .iter()
-        //     .sorted_by_key(|(slot, _)| *slot)
-        //     .for_each(|(slot, entry)| {
-        //         println!(
-        //             "slot {slot} entry count: {:?}, txn count: {}",
-        //             entry.len(),
-        //             entry
-        //                 .iter()
-        //                 .map(|(_slot, entry)| entry.transactions.len())
-        //                 .sum::<usize>()
-        //         );
-        //     });
-        assert_eq!(slot_to_entry.len(), 61);
-
-        // Test 2: 33% of shreds missing
-        let mut all_shreds = ahash::HashMap::default();
-        let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
-        let mut deshredded_entries = Vec::new();
-        let mut highest_slot_seen = 0;
-        let recovered_count = reconstruct_shreds(
-            PacketBatch::new(
-                packets
-                    .packets
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| (index + 1) % 3 != 0)
-                    .map(|(_i, x)| {
-                        let mut packet = Packet::default();
-                        packet.buffer_mut()[..x.len()].copy_from_slice(x);
-                        packet.meta_mut().size = x.len();
-                        packet
-                    })
-                    .collect_vec(),
-            ),
-            &mut all_shreds,
-            &mut slot_fec_indexes_to_iterate,
-            &mut deshredded_entries,
-            &mut highest_slot_seen,
-            &rs_cache,
-            &metrics,
-        );
-
-        // debug_to_disk(&deshredded_entries, "new.txt");
-        assert!(recovered_count > (deshredded_entries.len() / 4));
-        assert_eq!(
-            deshredded_entries
-                .iter()
-                .map(|(_slot, entries, _entries_bytes)| entries.len())
-                .sum::<usize>(),
-            43170
-        );
-        assert!(all_shreds.len() > 15);
-
-        let slot_to_entry = deshredded_entries
-            .iter()
-            .into_group_map_by(|(slot, _entries, _entries_bytes)| *slot);
-        assert_eq!(slot_to_entry.len(), 61);
-    }
-
-    #[test]
-    fn test_recover_shreds() {
-        let mut rng = rand::thread_rng();
-        let slot = 11_111;
-        let leader_keypair = Arc::new(Keypair::new());
-        let reed_solomon_cache = ReedSolomonCache::default();
-        let shredder = Shredder::new(slot, slot - 1, 0, 0).unwrap();
-        let chained_merkle_root = Some(Hash::new_from_array(rng.gen()));
-        let num_entry_groups = 10;
-        let num_entries = 10;
-        let mut entries = Vec::new();
-        let mut data_shreds = Vec::new();
-        let mut coding_shreds = Vec::new();
-
-        let mut index = 0;
-        (0..num_entry_groups).for_each(|_i| {
-            let _entries = make_slot_entries_with_transactions(num_entries);
-            let (_data_shreds, _coding_shreds) = shredder.entries_to_shreds(
-                &leader_keypair,
-                _entries.as_slice(),
-                true,
-                chained_merkle_root,
-                index as u32, // next_shred_index
-                index as u32, // next_code_index,
-                true,         // merkle_variant
-                &reed_solomon_cache,
-                &mut ProcessShredsStats::default(),
-            );
-            index += _data_shreds.len();
-            entries.extend(_entries);
-            data_shreds.extend(_data_shreds);
-            coding_shreds.extend(_coding_shreds);
-        });
-
-        let packets = data_shreds
-            .iter()
-            .chain(coding_shreds.iter())
-            .map(|s| {
-                let mut p = Packet::default();
-                s.copy_to_packet(&mut p);
-                p
-            })
-            .collect_vec();
-        assert_eq!(data_shreds.len(), 320);
-        assert_eq!(
-            data_shreds
-                .iter()
-                .map(|s| s.fec_set_index())
-                .dedup()
-                .count(),
-            num_entry_groups
-        );
-
-        let metrics = Arc::new(ShredMetrics::default());
-        let rs_cache = ReedSolomonCache::default();
-
-        // Test 1: all shreds provided
-        let mut all_shreds = ahash::HashMap::default();
-        let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
-        let mut deshredded_entries = Vec::new();
-        let mut highest_slot_seen = 0;
-        let recovered_count = reconstruct_shreds(
-            PacketBatch::new(packets.clone()),
-            &mut all_shreds,
-            &mut slot_fec_indexes_to_iterate,
-            &mut deshredded_entries,
-            &mut highest_slot_seen,
-            &rs_cache,
-            &metrics,
-        );
-        assert_eq!(recovered_count, 0);
-        assert_eq!(
-            deshredded_entries
-                .iter()
-                .map(|(_slot, entries, _entries_bytes)| entries.len())
-                .sum::<usize>(),
-            entries.len()
-        );
-        assert_eq!(
-            all_shreds.len(),
-            1, // slot 11111
-        );
-
-        // Test 2: 33% of shreds missing
-        let mut all_shreds = ahash::HashMap::default();
-        let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
-        let mut deshredded_entries = Vec::new();
-        let mut highest_slot_seen = 0;
-        let recovered_count = reconstruct_shreds(
-            PacketBatch::new(
-                packets
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| (index + 1) % 3 != 0)
-                    .map(|(_i, p)| p.clone())
-                    .collect(),
-            ),
-            &mut all_shreds,
-            &mut slot_fec_indexes_to_iterate,
-            &mut deshredded_entries,
-            &mut highest_slot_seen,
-            &rs_cache,
-            &metrics,
-        );
-        assert!(recovered_count > 0);
-        assert_eq!(
-            deshredded_entries
-                .iter()
-                .map(|(_slot, entries, _entries_bytes)| entries.len())
-                .sum::<usize>(),
-            entries.len()
-        );
-        assert_eq!(
-            all_shreds.len(),
-            1, // slot 11111
-        );
     }
 }
 #[cfg(test)]

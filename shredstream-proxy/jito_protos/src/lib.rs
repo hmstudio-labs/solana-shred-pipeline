@@ -9,3 +9,7 @@ pub mod auth {
 pub mod shredstream {
     tonic::include_proto!("shredstream");
 }
+
+pub mod filtered {
+    tonic::include_proto!("filtered");
+}

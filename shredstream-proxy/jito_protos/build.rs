@@ -8,11 +8,14 @@ fn main() {
     }
 
     configure()
+        .build_server(true)
+        .build_client(true)
         .compile_protos(
             &[
                 "protos/auth.proto",
                 "protos/shared.proto",
                 "protos/shredstream.proto",
+                "protos/filtered.proto",
             ],
             &["protos"],
         )

@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package filtered;
+
+// Filtered transaction stream service
+service FilteredTxStream {
+  // Stream filtered transactions based on program IDs and instruction types
+  rpc StreamTxs(StreamRequest) returns (stream TxData);
+}
+
+message StreamRequest {
+}
+
+message TxData {
+  // The slot that the transaction is from
+  uint64 slot = 1;
+
+  // The mint address or other relevant data extracted from the transaction
+  string mint = 2;
+}
