@@ -91,26 +91,6 @@ fn filter_entries(slot: u64, entries: &[solana_entry::entry::Entry], filtered_se
                     }
                 }
             }
-
-            // Check for PumpFun AMM program
-            if let Some(_pid) = accounts.iter().position(|k| *k == PUMPFUN_AMM_PROGRAM_ID) {
-                for instruction in tx.message.instructions().iter() {
-                    if instruction.program_id_index as usize != _pid {
-                        continue;
-                    }
-
-                    debug!(
-                        "Found PumpFun AMM instruction: slot={}, tx={}",
-                        slot,
-                        tx.signatures[0].to_string()
-                    );
-
-                    let _ = filtered_sender.send(TxData {
-                        slot,
-                        mint: String::new(),
-                    });
-                }
-            }
         }
     }
 }
