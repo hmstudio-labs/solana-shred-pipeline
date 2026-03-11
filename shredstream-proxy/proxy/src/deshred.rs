@@ -6,7 +6,7 @@ use jito_protos::{
     filtered::TxData,
 };
 use log::warn;
-use phf::phf_set;
+use once_cell::sync::Lazy;
 use prost::Message;
 use solana_ledger::{
     blockstore::MAX_DATA_SHREDS_PER_SLOT,
@@ -28,15 +28,18 @@ use crate::forwarder::ShredMetrics;
 pub const RAYDIUM_PROGRAM_ID: Pubkey = Pubkey::from_str_const("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
 pub const PUMPFUN_AMM_PROGRAM_ID: Pubkey = Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
 
-// PERF: Compile-time perfect hash set for O(1) lookup with minimal overhead
-static STABLE_MINTS: phf::Set<&'static [u8]> = phf_set! {
-    b"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
-    b"Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
-    b"27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4", // JLP
-    b"HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr", // EURC
-    b"4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R", // RAY
-    b"BkDKvbUQpr17c5w3zZzEA1VvpirgWcKuMEHtiYGEaP1c", // SMRT
-};
+// PERF: Lazy-initialized HashSet for stable mint filtering
+// BUGFIX: Use Pubkey type for correct comparison (not base58 strings!)
+static STABLE_MINTS: Lazy<HashSet<Pubkey>> = Lazy::new(|| {
+    HashSet::from([
+        Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"), // USDC
+        Pubkey::from_str_const("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"), // USDT
+        Pubkey::from_str_const("27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"), // JLP
+        Pubkey::from_str_const("HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr"), // EURC
+        Pubkey::from_str_const("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"), // RAY
+        Pubkey::from_str_const("BkDKvbUQpr17c5w3zZzEA1VvpirgWcKuMEHtiYGEaP1c"), // SMRT
+    ])
+});
 
 const RAY_DECREASE_LIQUIDITY_V2: [u8; 8] = [58, 127, 188, 62, 79, 82, 196, 96];
 
@@ -72,8 +75,8 @@ fn filter_entries(slot: u64, entries: &[solana_entry::entry::Entry], filtered_se
                         }
                         let mint_pubkey = &accounts[index];
 
-                        // PERF: Skip stable mints using compile-time perfect hash
-                        if STABLE_MINTS.contains(mint_pubkey.as_ref()) {
+                        // PERF: Skip stable mints using HashSet lookup
+                        if STABLE_MINTS.contains(mint_pubkey) {
                             continue;
                         }
 
