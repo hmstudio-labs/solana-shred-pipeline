@@ -20,6 +20,7 @@ itertools = { workspace = true }
 once_cell = { workspace = true }
 jito-protos = { workspace = true }
 log = { workspace = true }
+phf = { features = ["macros"], version = "0.11" }
 prost = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }

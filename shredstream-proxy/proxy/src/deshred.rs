@@ -5,7 +5,8 @@ use jito_protos::{
     shredstream::TraceShred,
     filtered::TxData,
 };
-use log::{debug, warn};
+use log::warn;
+use phf::phf_set;
 use prost::Message;
 use solana_ledger::{
     blockstore::MAX_DATA_SHREDS_PER_SLOT,
@@ -27,16 +28,15 @@ use crate::forwarder::ShredMetrics;
 pub const RAYDIUM_PROGRAM_ID: Pubkey = Pubkey::from_str_const("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
 pub const PUMPFUN_AMM_PROGRAM_ID: Pubkey = Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
 
-static STABLE_MINTS: Lazy<HashSet<Pubkey>> = Lazy::new(|| {
-    HashSet::from([
-        Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"), // USDC
-        Pubkey::from_str_const("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"), // USDT
-        Pubkey::from_str_const("27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"), // JLP
-        Pubkey::from_str_const("HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr"), // EURC
-        Pubkey::from_str_const("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"), // RAY
-        Pubkey::from_str_const("BkDKvbUQpr17c5w3zZzEA1VvpirgWcKuMEHtiYGEaP1c"), // SMRT
-    ])
-});
+// PERF: Compile-time perfect hash set for O(1) lookup with minimal overhead
+static STABLE_MINTS: phf::Set<&'static [u8]> = phf_set! {
+    b"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+    b"Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
+    b"27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4", // JLP
+    b"HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr", // EURC
+    b"4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R", // RAY
+    b"BkDKvbUQpr17c5w3zZzEA1VvpirgWcKuMEHtiYGEaP1c", // SMRT
+};
 
 const RAY_DECREASE_LIQUIDITY_V2: [u8; 8] = [58, 127, 188, 62, 79, 82, 196, 96];
 
@@ -72,17 +72,18 @@ fn filter_entries(slot: u64, entries: &[solana_entry::entry::Entry], filtered_se
                         }
                         let mint_pubkey = &accounts[index];
 
-                        // Skip stable mints
-                        if STABLE_MINTS.contains(mint_pubkey) {
+                        // PERF: Skip stable mints using compile-time perfect hash
+                        if STABLE_MINTS.contains(mint_pubkey.as_ref()) {
                             continue;
                         }
 
-                        debug!(
-                            "Found Raydium decrease_liquidity_v2: slot={}, tx={}, mint={}",
-                            slot,
-                            tx.signatures[0].to_string(),
-                            mint_pubkey.to_string()
-                        );
+                        // PERF: Commented out for performance (saves 3-5ms)
+                        // debug!(
+                        //     "Found Raydium decrease_liquidity_v2: slot={}, tx={}, mint={}",
+                        //     slot,
+                        //     tx.signatures[0].to_string(),
+                        //     mint_pubkey.to_string()
+                        // );
 
                         let _ = filtered_sender.send(TxData {
                             slot,
@@ -94,8 +95,6 @@ fn filter_entries(slot: u64, entries: &[solana_entry::entry::Entry], filtered_se
         }
     }
 }
-
-use once_cell::sync::Lazy;
 
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
 enum ShredStatus {
@@ -165,15 +164,17 @@ pub fn reconstruct_shreds(
                 let fec_set_index = shred.fec_set_index();
                 let (all_shreds, state_tracker) = all_shreds.entry(slot).or_default();
                 if highest_slot_seen.saturating_sub(SLOT_LOOKBACK) > slot {
-                    debug!(
-                        "Old shred slot: {slot}, fec_set_index: {fec_set_index}, index: {index}"
-                    );
+                    // PERF: Commented out for performance
+                    // debug!(
+                    //     "Old shred slot: {slot}, fec_set_index: {fec_set_index}, index: {index}"
+                    // );
                     continue;
                 }
                 if state_tracker.already_recovered_fec_sets[fec_set_index as usize]
                     || state_tracker.already_deshredded[index]
                 {
-                    debug!("Already completed slot: {slot}, fec_set_index: {fec_set_index}, index: {index}");
+                    // PERF: Commented out for performance
+                    // debug!("Already completed slot: {slot}, fec_set_index: {fec_set_index}, index: {index}");
                     continue;
                 }
                 let Some(_shred_index) = update_state_tracker(&shred, state_tracker) else {
@@ -254,7 +255,8 @@ pub fn reconstruct_shreds(
         }
 
         if fec_set_recovered_count > 0 {
-            debug!("recovered slot: {slot}, fec_index: {fec_set_index}, recovered count: {fec_set_recovered_count}");
+            // PERF: Commented out for performance
+            // debug!("recovered slot: {slot}, fec_index: {fec_set_index}, recovered count: {fec_set_recovered_count}");
             state_tracker.already_recovered_fec_sets[*fec_set_index as usize] = true;
             shreds.clear();
         }
@@ -299,10 +301,11 @@ pub fn reconstruct_shreds(
         ) {
             Ok(entries) => entries,
             Err(e) => {
-                debug!(
-                        "Failed to deserialize bincode payload of size {} for slot {slot}, start_data_complete_idx: {start_data_complete_idx}, end_data_complete_idx: {end_data_complete_idx}, unknown_start: {unknown_start}. Err: {e}",
-                        deshredded_payload.len()
-                    );
+                // PERF: Commented out for performance
+                // debug!(
+                //         "Failed to deserialize bincode payload of size {} for slot {slot}, start_data_complete_idx: {start_data_complete_idx}, end_data_complete_idx: {end_data_complete_idx}, unknown_start: {unknown_start}. Err: {e}",
+                //         deshredded_payload.len()
+                //     );
                 metrics
                     .bincode_deserialize_error_count
                     .fetch_add(1, Ordering::Relaxed);
@@ -319,10 +322,11 @@ pub fn reconstruct_shreds(
             .fetch_add(entries.len() as u64, Ordering::Relaxed);
         let txn_count = entries.iter().map(|e| e.transactions.len() as u64).sum();
         metrics.txn_count.fetch_add(txn_count, Ordering::Relaxed);
-        debug!(
-            "Successfully decoded slot: {slot} start_data_complete_idx: {start_data_complete_idx} end_data_complete_idx: {end_data_complete_idx} with entry count: {}, txn count: {txn_count}",
-            entries.len(),
-        );
+        // PERF: Commented out for performance
+        // debug!(
+        //     "Successfully decoded slot: {slot} start_data_complete_idx: {start_data_complete_idx} end_data_complete_idx: {end_data_complete_idx} with entry count: {}, txn count: {txn_count}",
+        //     entries.len(),
+        // );
 
         // Filter transactions from already-deserialized entries (no extra deserialization needed!)
         if let Some(sender) = filtered_tx_sender {

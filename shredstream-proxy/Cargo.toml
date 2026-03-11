@@ -44,5 +44,24 @@ tonic = { version = "0.13", features = ["tls-webpki-roots"] }
 tonic-build = "0.13"
 
 [profile.release]
-# thin has minimal overhead vs none (default): https://blog.llvm.org/2016/06/thinlto-scalable-and-incremental-lto.html
+# Maximum optimization for performance
+opt-level = 3
+# Fat LTO: better performance than thin, slower compile
+lto = "fat"
+# Single codegen unit for better optimization (slower compile)
+codegen-units = 1
+# Abort on panic for smaller binary and better performance
+panic = "abort"
+# Strip symbols for smaller binary
+strip = true
+# Enable all LLVM optimizations
+overflow-checks = false
+
+[profile.dev]
+# Faster dev builds with some optimizations
+opt-level = 1
+# Enable LTO in dev for better performance
 lto = "thin"
+# Disable debug info for faster compile
+debug = 0
+overflow-checks = false
