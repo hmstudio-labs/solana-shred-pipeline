@@ -571,21 +571,22 @@ pub fn reconstruct_shreds(
 
             false
         });
-        if incomplete_fec_sets_count > 0 {
-            incomplete_fec_sets
-                .iter_mut()
-                .for_each(|(_slot, fec_set_indexes)| fec_set_indexes.sort_unstable());
-            datapoint_warn!(
-                "shredstream_proxy-deshred_missed_fec_sets",
-                (
-                    "slot_fec_set_indexes",
-                    format!("{:?}", incomplete_fec_sets.iter().sorted().collect_vec()),
-                    String
-                ),
-                ("slot_count", incomplete_fec_sets.len(), i64),
-                ("fec_set_count", incomplete_fec_sets_count, i64),
-            );
-        }
+        // Removed warning log for missed FEC sets
+        // if incomplete_fec_sets_count > 0 {
+        //     incomplete_fec_sets
+        //         .iter_mut()
+        //         .for_each(|(_slot, fec_set_indexes)| fec_set_indexes.sort_unstable());
+        //     datapoint_warn!(
+        //         "shredstream_proxy-deshred_missed_fec_sets",
+        //         (
+        //             "slot_fec_set_indexes",
+        //             format!("{:?}", incomplete_fec_sets.iter().sorted().collect_vec()),
+        //             String
+        //         ),
+        //         ("slot_count", incomplete_fec_sets.len(), i64),
+        //         ("fec_set_count", incomplete_fec_sets_count, i64),
+        //     );
+        // }
     }
 
     if total_recovered_count > 0 {
