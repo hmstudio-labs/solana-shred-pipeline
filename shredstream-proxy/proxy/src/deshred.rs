@@ -132,6 +132,14 @@ fn filter_entries(
     let mut filtered_match_count = 0;
     for entry in entries.iter() {
         for tx in &entry.transactions {
+            let accounts = tx.message.static_account_keys();
+
+            // Fast path: skip simple transactions with <= 20 accounts
+            // DEX operations typically involve more accounts (tokens, pools, authority, etc.)
+            if accounts.len() <= 20 {
+                continue;
+            }
+
             let instructions = tx.message.instructions();
             if instructions.is_empty() {
                 continue;
@@ -142,14 +150,6 @@ fn filter_entries(
                     && is_raydium_decrease_liquidity_v2(&instruction.data)
             });
             if !has_candidate_instruction {
-                continue;
-            }
-
-            let accounts = tx.message.static_account_keys();
-
-            // Fast path: skip simple transactions with <= 20 accounts
-            // DEX operations typically involve more accounts (tokens, pools, authority, etc.)
-            if accounts.len() <= 20 {
                 continue;
             }
 
