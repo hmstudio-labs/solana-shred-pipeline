@@ -8,7 +8,6 @@ use std::{
 };
 
 use crossbeam_channel::Receiver;
-use solana_metrics::datapoint_info;
 use solana_perf::deduper::Deduper;
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
@@ -193,66 +192,16 @@ impl ShredMetrics {
         let unknown_start_position_error_count =
             self.unknown_start_position_error_count.swap(0, Ordering::Relaxed);
 
-        datapoint_info!(
-            "shredstream_proxy-metrics",
-            ("received", received, i64),
-            ("packet_batches", packet_batches, i64),
-            ("precopy_old_slot_skip_count", precopy_old_slot_skip_count, i64),
-            (
-                "precopy_completed_skip_count",
-                precopy_completed_skip_count,
-                i64
-            ),
-            ("parse_shred_elapsed_us", parse_shred_elapsed_us, i64),
-            ("dedup_elapsed_us", dedup_elapsed_us, i64),
-            ("reconstruct_elapsed_us", reconstruct_elapsed_us, i64),
-        );
+        // Removed duplicate datapoint logs, merged into 5s metrics below
 
         if self.enabled_grpc_service {
-            datapoint_info!(
-                "shredstream_proxy-service_metrics",
-                ("recovered_count", recovered_count, i64),
-                ("entry_count", self.entry_count.load(Ordering::Relaxed), i64),
-                ("txn_count", self.txn_count.load(Ordering::Relaxed), i64),
-                ("unknown_start_position_count", unknown_start_position_count, i64),
-                ("fec_recovery_error_count", fec_recovery_error_count, i64),
-                (
-                    "bincode_deserialize_error_count",
-                    bincode_deserialize_error_count,
-                    i64
-                ),
-                (
-                    "unknown_start_position_error_count",
-                    unknown_start_position_error_count,
-                    i64
-                ),
-                ("fec_recovery_attempt_count", fec_recovery_attempt_count, i64),
-                ("fec_recovery_success_count", fec_recovery_success_count, i64),
-                ("fec_recovery_elapsed_us", fec_recovery_elapsed_us, i64),
-                ("deshred_segment_count", deshred_segment_count, i64),
-                ("deshred_elapsed_us", deshred_elapsed_us, i64),
-                (
-                    "bincode_deserialize_attempt_count",
-                    bincode_deserialize_attempt_count,
-                    i64
-                ),
-                (
-                    "bincode_deserialize_elapsed_us",
-                    bincode_deserialize_elapsed_us,
-                    i64
-                ),
-                ("filtered_tx_match_count", filtered_tx_match_count, i64),
-                ("filter_invocation_count", filter_invocation_count, i64),
-                ("filter_elapsed_us", filter_elapsed_us, i64),
-                ("grpc_entry_send_count", grpc_entry_send_count, i64),
-                ("grpc_entry_send_elapsed_us", grpc_entry_send_elapsed_us, i64),
-            );
-
             let avg = |total: u64, count: u64| -> u64 {
                 if count == 0 { 0 } else { total / count }
             };
+            let entry_count = self.entry_count.load(Ordering::Relaxed);
+            let txn_count = self.txn_count.load(Ordering::Relaxed);
             log::info!(
-                "5s metrics: recv_shreds={} batches={} parse_us={} dedup_us={} reconstruct_us={} fec_attempts={} fec_success_sets={} fec_recovered_shreds={} fec_us={} deshred_segments={} deshred_avg_us={} bincode_attempts={} bincode_avg_us={} filtered_matches={} filter_calls={} filter_avg_us={} grpc_entry_sends={} grpc_entry_avg_us={} precopy_old_skips={} precopy_done_skips={}",
+                "5s metrics: recv_shreds={} batches={} parse_us={} dedup_us={} reconstruct_us={} fec_attempts={} fec_success_sets={} fec_recovered_shreds={} fec_us={} deshred_segments={} deshred_avg_us={} bincode_attempts={} bincode_avg_us={} filtered_matches={} filter_calls={} filter_avg_us={} grpc_entry_sends={} grpc_entry_avg_us={} precopy_old_skips={} precopy_done_skips={} | entries={} txns={} | unknown_start_pos={} fec_errors={} bincode_errors={} unknown_start_errors={}",
                 received,
                 packet_batches,
                 parse_shred_elapsed_us,
@@ -273,6 +222,13 @@ impl ShredMetrics {
                 avg(grpc_entry_send_elapsed_us, grpc_entry_send_count),
                 precopy_old_slot_skip_count,
                 precopy_completed_skip_count,
+                // Merged from service_metrics
+                entry_count,
+                txn_count,
+                unknown_start_position_count,
+                fec_recovery_error_count,
+                bincode_deserialize_error_count,
+                unknown_start_position_error_count,
             );
         }
     }

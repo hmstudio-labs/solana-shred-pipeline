@@ -21,7 +21,6 @@ use solana_ledger::{
         ReedSolomonCache, ShredType, Shredder,
     },
 };
-use solana_metrics::datapoint_warn;
 use solana_perf::packet::{Packet, PacketBatch};
 use solana_sdk::{clock::{Slot, MAX_PROCESSING_AGE}, pubkey::Pubkey};
 use tokio::sync::broadcast::Sender;
