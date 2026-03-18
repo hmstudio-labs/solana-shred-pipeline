@@ -142,19 +142,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_receiver.clone(),
     );
 
-    // Create multicast socket
+    // Create multicast socket (optional)
     let multicast_sockets = create_multicast_socket_on_device(
         &args.multicast_device,
         args.multicast_subscribe_port,
         args.multicast_bind_ip,
     ).unwrap_or_default();
-    if multicast_sockets.is_empty() {
-        return Err(Box::new(io::Error::new(
-            io::ErrorKind::NotFound,
-            "No multicast listeners found",
-        )));
+    if !multicast_sockets.is_empty() {
+        info!("Multicast listeners found: {:?}", multicast_sockets);
+    } else {
+        info!("No multicast listeners found, running in unicast-only mode");
     }
-    info!("Multicast listeners found: {:?}", multicast_sockets);
 
     // Bind listening socket for unicast shreds
     let (port, sockets) = solana_net_utils::multi_bind_in_range_with_config(
