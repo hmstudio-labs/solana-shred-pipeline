@@ -1,4 +1,9 @@
-use std::{collections::HashSet, hash::Hash, sync::atomic::Ordering};
+use std::{
+    collections::HashSet,
+    hash::Hash,
+    sync::atomic::Ordering,
+    time::Instant,
+};
 
 use itertools::Itertools;
 use jito_protos::{
@@ -11,12 +16,13 @@ use prost::Message;
 use solana_ledger::{
     blockstore::MAX_DATA_SHREDS_PER_SLOT,
     shred::{
+        layout,
         merkle::{Shred, ShredCode},
         ReedSolomonCache, ShredType, Shredder,
     },
 };
 use solana_metrics::datapoint_warn;
-use solana_perf::packet::PacketBatch;
+use solana_perf::packet::{Packet, PacketBatch};
 use solana_sdk::{clock::{Slot, MAX_PROCESSING_AGE}, pubkey::Pubkey};
 use tokio::sync::broadcast::Sender;
 
@@ -26,7 +32,6 @@ use crate::forwarder::ShredMetrics;
 // Transaction Filtering Constants
 // ======================================================
 pub const RAYDIUM_PROGRAM_ID: Pubkey = Pubkey::from_str_const("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
-pub const PUMPFUN_AMM_PROGRAM_ID: Pubkey = Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
 
 // PERF: Lazy-initialized HashSet for stable mint filtering
 // BUGFIX: Use Pubkey type for correct comparison (not base58 strings!)
@@ -43,15 +48,104 @@ static STABLE_MINTS: Lazy<HashSet<Pubkey>> = Lazy::new(|| {
 
 const RAY_DECREASE_LIQUIDITY_V2: [u8; 8] = [58, 127, 188, 62, 79, 82, 196, 96];
 
+/// PERF: Wrapper for FEC set shreds with O(1) counters for get_data_shred_info
+/// This avoids O(n) iteration over the HashSet on every FEC recovery attempt
+#[derive(Debug, Default)]
+pub struct FecSetShreds {
+    shreds: HashSet<ComparableShred>,
+    num_data_shreds: u16,
+    num_coding_shreds: u16,
+    num_expected_data_shreds: u16,
+    num_expected_coding_shreds: u16,
+}
+
+impl FecSetShreds {
+    fn len(&self) -> usize {
+        self.shreds.len()
+    }
+
+    fn insert(&mut self, shred: ComparableShred) -> bool {
+        // PERF: Count statistics before insert to avoid extra iteration
+        let (num_data, num_coding, num_expected_data, num_expected_coding) = match &shred.0 {
+            Shred::ShredCode(s) => (
+                0,
+                1,
+                s.coding_header.num_data_shreds,
+                s.coding_header.num_coding_shreds,
+            ),
+            Shred::ShredData(s) => {
+                let expected = if s.data_complete() || s.last_in_slot() {
+                    (shred.0.index() - shred.0.fec_set_index()) as u16 + 1
+                } else {
+                    0
+                };
+                (1, 0, expected, 0)
+            }
+        };
+
+        let is_new = self.shreds.insert(shred);
+        if is_new {
+            self.num_data_shreds += num_data;
+            self.num_coding_shreds += num_coding;
+            if num_expected_data > 0 {
+                self.num_expected_data_shreds = num_expected_data;
+            }
+            if num_expected_coding > 0 {
+                self.num_expected_coding_shreds = num_expected_coding;
+            }
+        }
+        is_new
+    }
+
+    fn clear(&mut self) {
+        self.shreds.clear();
+        self.num_data_shreds = 0;
+        self.num_coding_shreds = 0;
+        // Keep expected values as they're useful for the next FEC set
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &ComparableShred> {
+        self.shreds.iter()
+    }
+}
+
 #[inline(always)]
 fn is_raydium_decrease_liquidity_v2(data: &[u8]) -> bool {
     data.len() >= 8 && data[..8] == RAY_DECREASE_LIQUIDITY_V2
 }
 
+/// PERF: Find program index with optimized search
+/// For small arrays (≤ 32), linear search is faster than HashSet due to cache locality
+/// For very large arrays, we could use HashSet, but most DEX txs have 20-30 accounts
+#[inline(always)]
+fn find_program_index(accounts: &[Pubkey], target: &Pubkey) -> Option<usize> {
+    // Linear search with early exit is optimal for typical account array sizes (20-40)
+    // HashSet overhead exceeds benefits for these sizes
+    accounts.iter().position(|k| k == target)
+}
+
 /// Filter transactions from already-deserialized entries
-fn filter_entries(slot: u64, entries: &[solana_entry::entry::Entry], filtered_sender: &Sender<TxData>) {
+fn filter_entries(
+    slot: u64,
+    entries: &[solana_entry::entry::Entry],
+    filtered_sender: &Sender<TxData>,
+) -> u64 {
+    let mut filtered_match_count = 0;
     for entry in entries.iter() {
         for tx in &entry.transactions {
+            let instructions = tx.message.instructions();
+            if instructions.is_empty() {
+                continue;
+            }
+
+            let has_candidate_instruction = instructions.iter().any(|instruction| {
+                instruction.accounts.len() >= 17
+                    && is_raydium_decrease_liquidity_v2(&instruction.data)
+            });
+            if !has_candidate_instruction {
+                continue;
+            }
+
             let accounts = tx.message.static_account_keys();
 
             // Fast path: skip simple transactions with <= 20 accounts
@@ -60,43 +154,57 @@ fn filter_entries(slot: u64, entries: &[solana_entry::entry::Entry], filtered_se
                 continue;
             }
 
-            // Check for Raydium program
-            if let Some(pid) = accounts.iter().position(|k| *k == RAYDIUM_PROGRAM_ID) {
-                for instruction in tx.message.instructions().iter() {
-                    if instruction.program_id_index as usize != pid {
+            // PERF: Use optimized program index search
+            let pid = match find_program_index(accounts, &RAYDIUM_PROGRAM_ID) {
+                Some(idx) => idx,
+                None => continue,
+            };
+
+            for instruction in instructions.iter() {
+                if instruction.program_id_index as usize != pid {
+                    continue;
+                }
+
+                // Filter Raydium decrease_liquidity_v2
+                if is_raydium_decrease_liquidity_v2(&instruction.data) && instruction.accounts.len() >= 17 {
+                    let index = instruction.accounts[15] as usize;
+                    if index >= accounts.len() {
+                        continue;
+                    }
+                    let mint_pubkey = &accounts[index];
+
+                    // PERF: Skip stable mints using HashSet lookup
+                    if STABLE_MINTS.contains(mint_pubkey) {
                         continue;
                     }
 
-                    // Filter Raydium decrease_liquidity_v2
-                    if is_raydium_decrease_liquidity_v2(&instruction.data) && instruction.accounts.len() >= 17 {
-                        let index = instruction.accounts[15] as usize;
-                        if index >= accounts.len() {
-                            continue;
-                        }
-                        let mint_pubkey = &accounts[index];
-
-                        // PERF: Skip stable mints using HashSet lookup
-                        if STABLE_MINTS.contains(mint_pubkey) {
-                            continue;
-                        }
-
-                        // PERF: Commented out for performance (saves 3-5ms)
-                        // debug!(
-                        //     "Found Raydium decrease_liquidity_v2: slot={}, tx={}, mint={}",
-                        //     slot,
-                        //     tx.signatures[0].to_string(),
-                        //     mint_pubkey.to_string()
-                        // );
-
-                        let _ = filtered_sender.send(TxData {
-                            slot,
-                            mint: mint_pubkey.to_string(),
-                        });
-                    }
+                    let _ = filtered_sender.send(TxData {
+                        slot,
+                        mint: mint_pubkey.to_string(),
+                    });
+                    filtered_match_count += 1;
                 }
             }
         }
     }
+    filtered_match_count
+}
+
+#[inline(always)]
+fn get_fec_set_index(shred: &[u8]) -> Option<u32> {
+    // ShredCommonHeader layout is fixed: signature[64] + variant[1] + slot[8] + index[4]
+    // + version[2] + fec_set_index[4].
+    let bytes = <[u8; 4]>::try_from(shred.get(79..83)?).ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+#[inline(always)]
+fn get_packet_shred_metadata(packet: &Packet) -> Option<(Slot, usize, u32)> {
+    let shred = layout::get_shred(packet)?;
+    let slot = layout::get_slot(shred)?;
+    let index = layout::get_index(shred)? as usize;
+    let fec_set_index = get_fec_set_index(shred)?;
+    Some((slot, index, fec_set_index))
 }
 
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
@@ -143,7 +251,7 @@ pub fn reconstruct_shreds(
     all_shreds: &mut ahash::HashMap<
         Slot,
         (
-            ahash::HashMap<u32 /* fec_set_index */, HashSet<ComparableShred>>,
+            ahash::HashMap<u32 /* fec_set_index */, FecSetShreds>,
             ShredsStateTracker,
         ),
     >,
@@ -152,15 +260,47 @@ pub fn reconstruct_shreds(
     highest_slot_seen: &mut Slot,
     rs_cache: &ReedSolomonCache,
     metrics: &ShredMetrics,
+    emit_entries_to_grpc: bool,
     filtered_tx_sender: &Option<&Sender<TxData>>,
 ) -> usize {
     deshredded_entries.clear();
     slot_fec_indexes_to_iterate.clear();
     // ingest all packets
-    for packet in packet_batch.iter().filter_map(|p| p.data(..)) {
-        match solana_ledger::shred::Shred::new_from_serialized_shred(packet.to_vec())
+    for packet in packet_batch.iter() {
+        if let Some((slot, index, fec_set_index)) = get_packet_shred_metadata(packet) {
+            if highest_slot_seen.saturating_sub(SLOT_LOOKBACK) > slot {
+                metrics
+                    .precopy_old_slot_skip_count
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if let Some((_all_shreds, state_tracker)) = all_shreds.get(&slot) {
+                let fec_set_done = state_tracker
+                    .already_recovered_fec_sets
+                    .get(fec_set_index as usize)
+                    .copied();
+                let shred_done = state_tracker.already_deshredded.get(index).copied();
+                if matches!(fec_set_done, Some(true)) || matches!(shred_done, Some(true)) {
+                    metrics
+                        .precopy_completed_skip_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+        }
+
+        let Some(packet) = packet.data(..) else {
+            continue;
+        };
+        let parse_start = Instant::now();
+        let parsed_shred = solana_ledger::shred::Shred::new_from_serialized_shred(packet.to_vec())
             .and_then(Shred::try_from)
-        {
+        ;
+        metrics.parse_shred_elapsed_us.fetch_add(
+            parse_start.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        match parsed_shred {
             Ok(shred) => {
                 let slot = shred.common_header().slot;
                 let index = shred.index() as usize;
@@ -225,20 +365,30 @@ pub fn reconstruct_shreds(
         }
 
         // try to recover if we have enough shreds in the FEC set
-        let merkle_shreds = shreds
-            .iter()
-            .sorted_by_key(|s| (u8::MAX - s.shred_type() as u8, s.index()))
-            .map(|s| s.0.clone())
-            .collect_vec();
+        metrics
+            .fec_recovery_attempt_count
+            .fetch_add(1, Ordering::Relaxed);
+        let fec_start = Instant::now();
+        let mut merkle_shreds = Vec::with_capacity(shreds.len());
+        merkle_shreds.extend(shreds.iter().map(|s| s.0.clone()));
+        merkle_shreds.sort_unstable_by_key(|s| (u8::MAX - s.shred_type() as u8, s.index()));
         let recovered = match solana_ledger::shred::merkle::recover(merkle_shreds, rs_cache) {
             Ok(r) => r, // data shreds followed by code shreds (whatever was missing from to_deshred_payload)
             Err(e) => {
+                metrics.fec_recovery_elapsed_us.fetch_add(
+                    fec_start.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
                 warn!(
                     "Failed to recover shreds for slot {slot} fec_set_index {fec_set_index}. num_expected_data_shreds: {num_expected_data_shreds}, num_data_shreds: {num_data_shreds} num_expected_coding_shreds: {num_expected_coding_shreds} num_coding_shreds: {num_coding_shreds} Err: {e}",
                 );
                 continue;
             }
         };
+        metrics.fec_recovery_elapsed_us.fetch_add(
+            fec_start.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
 
         let mut fec_set_recovered_count = 0;
         for shred in recovered {
@@ -258,6 +408,9 @@ pub fn reconstruct_shreds(
         }
 
         if fec_set_recovered_count > 0 {
+            metrics
+                .fec_recovery_success_count
+                .fetch_add(1, Ordering::Relaxed);
             // PERF: Commented out for performance
             // debug!("recovered slot: {slot}, fec_index: {fec_set_index}, recovered count: {fec_set_recovered_count}");
             state_tracker.already_recovered_fec_sets[*fec_set_index as usize] = true;
@@ -281,11 +434,19 @@ pub fn reconstruct_shreds(
 
         let to_deshred =
             &state_tracker.data_shreds[start_data_complete_idx..=end_data_complete_idx];
+        metrics
+            .deshred_segment_count
+            .fetch_add(1, Ordering::Relaxed);
+        let deshred_start = Instant::now();
         let deshredded_payload = match Shredder::deshred(
             to_deshred.iter().map(|s| s.as_ref().unwrap().payload()),
         ) {
             Ok(v) => v,
             Err(e) => {
+                metrics.deshred_elapsed_us.fetch_add(
+                    deshred_start.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
                 warn!("slot {slot} failed to deshred slot: {slot}, start_data_complete_idx: {start_data_complete_idx}, end_data_complete_idx: {end_data_complete_idx}. Err: {e}");
                 metrics
                     .fec_recovery_error_count
@@ -298,12 +459,24 @@ pub fn reconstruct_shreds(
                 continue;
             }
         };
+        metrics.deshred_elapsed_us.fetch_add(
+            deshred_start.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
 
+        metrics
+            .bincode_deserialize_attempt_count
+            .fetch_add(1, Ordering::Relaxed);
+        let bincode_start = Instant::now();
         let entries = match bincode::deserialize::<Vec<solana_entry::entry::Entry>>(
             &deshredded_payload,
         ) {
             Ok(entries) => entries,
-            Err(e) => {
+            Err(_e) => {
+                metrics.bincode_deserialize_elapsed_us.fetch_add(
+                    bincode_start.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
                 // PERF: Commented out for performance
                 // debug!(
                 //         "Failed to deserialize bincode payload of size {} for slot {slot}, start_data_complete_idx: {start_data_complete_idx}, end_data_complete_idx: {end_data_complete_idx}, unknown_start: {unknown_start}. Err: {e}",
@@ -320,6 +493,10 @@ pub fn reconstruct_shreds(
                 continue;
             }
         };
+        metrics.bincode_deserialize_elapsed_us.fetch_add(
+            bincode_start.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
         metrics
             .entry_count
             .fetch_add(entries.len() as u64, Ordering::Relaxed);
@@ -333,10 +510,24 @@ pub fn reconstruct_shreds(
 
         // Filter transactions from already-deserialized entries (no extra deserialization needed!)
         if let Some(sender) = filtered_tx_sender {
-            filter_entries(*slot, &entries, sender);
+            metrics
+                .filter_invocation_count
+                .fetch_add(1, Ordering::Relaxed);
+            let filter_start = Instant::now();
+            let filtered_match_count = filter_entries(*slot, &entries, sender);
+            metrics.filtered_tx_match_count.fetch_add(
+                filtered_match_count,
+                Ordering::Relaxed,
+            );
+            metrics.filter_elapsed_us.fetch_add(
+                filter_start.elapsed().as_micros() as u64,
+                Ordering::Relaxed,
+            );
         }
 
-        deshredded_entries.push((*slot, entries, deshredded_payload));
+        if emit_entries_to_grpc {
+            deshredded_entries.push((*slot, entries, deshredded_payload));
+        }
         to_deshred.iter().for_each(|shred| {
             let Some(shred) = shred.as_ref() else {
                 return;
@@ -411,7 +602,7 @@ fn debug_remaining_shreds(
     all_shreds: &mut ahash::HashMap<
         Slot,
         (
-            ahash::HashMap<u32, HashSet<ComparableShred>>,
+            ahash::HashMap<u32, FecSetShreds>,
             ShredsStateTracker,
         ),
     >,
@@ -538,40 +729,22 @@ fn update_state_tracker(shred: &Shred, state_tracker: &mut ShredsStateTracker) -
 
 const SLOT_LOOKBACK: Slot = 50;
 
-/// check if we can reconstruct (having minimum number of data + coding shreds)
+/// PERF: O(1) version - returns cached counters from FecSetShreds
+/// This replaces the O(n) iteration version that used HashSet<ComparableShred>
+#[inline(always)]
 fn get_data_shred_info(
-    shreds: &HashSet<ComparableShred>,
+    shreds: &FecSetShreds,
 ) -> (
     u16, /* num_expected_data_shreds */
     u16, /* num_expected_coding_shreds */
     u16, /* num_data_shreds */
     u16, /* num_coding_shreds */
 ) {
-    let mut num_expected_data_shreds = 0;
-    let mut num_expected_coding_shreds = 0;
-    let mut num_data_shreds = 0;
-    let mut num_coding_shreds = 0;
-    for shred in shreds {
-        match &shred.0 {
-            Shred::ShredCode(s) => {
-                num_coding_shreds += 1;
-                num_expected_data_shreds = s.coding_header.num_data_shreds;
-                num_expected_coding_shreds = s.coding_header.num_coding_shreds;
-            }
-            Shred::ShredData(s) => {
-                num_data_shreds += 1;
-                if num_expected_data_shreds == 0 && (s.data_complete() || s.last_in_slot()) {
-                    num_expected_data_shreds =
-                        (shred.0.index() - shred.0.fec_set_index()) as u16 + 1;
-                }
-            }
-        }
-    }
     (
-        num_expected_data_shreds,
-        num_expected_coding_shreds,
-        num_data_shreds,
-        num_coding_shreds,
+        shreds.num_expected_data_shreds,
+        shreds.num_expected_coding_shreds,
+        shreds.num_data_shreds,
+        shreds.num_coding_shreds,
     )
 }
 

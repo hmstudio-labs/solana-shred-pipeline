@@ -16,8 +16,8 @@ use jito_protos::{
         Entry as PbEntry, SubscribeEntriesRequest,
     },
 };
-use log::debug;
-use tokio::sync::broadcast::{Receiver as BroadcastReceiver, Sender};
+use log::{debug, warn};
+use tokio::sync::broadcast::{error::RecvError, Receiver as BroadcastReceiver, Sender};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 
 // ======================================================
@@ -73,17 +73,23 @@ impl ShredstreamProxy for ShredstreamProxyService {
         &self,
         _request: tonic::Request<SubscribeEntriesRequest>,
     ) -> Result<tonic::Response<Self::SubscribeEntriesStream>, tonic::Status> {
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        let (tx, rx) = tokio::sync::mpsc::channel(1024);
         let mut entry_receiver: BroadcastReceiver<PbEntry> = self.entry_sender.subscribe();
 
         tokio::spawn(async move {
-            while let Ok(entry) = entry_receiver.recv().await {
-                match tx.send(Ok(entry)).await {
-                    Ok(_) => (),
-                    Err(_e) => {
-                        debug!("client disconnected");
-                        break;
+            loop {
+                match entry_receiver.recv().await {
+                    Ok(entry) => match tx.send(Ok(entry)).await {
+                        Ok(_) => (),
+                        Err(_e) => {
+                            debug!("client disconnected");
+                            break;
+                        }
+                    },
+                    Err(RecvError::Lagged(skipped)) => {
+                        warn!("entry stream lagged, skipped {skipped} messages");
                     }
+                    Err(RecvError::Closed) => break,
                 }
             }
         });
@@ -107,17 +113,23 @@ impl FilteredTxStream for FilteredTxServiceImpl {
         &self,
         _request: tonic::Request<StreamRequest>,
     ) -> Result<tonic::Response<Self::StreamTxsStream>, tonic::Status> {
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        let (tx, rx) = tokio::sync::mpsc::channel(1024);
         let mut tx_receiver = self.filtered_tx_sender.subscribe();
 
         tokio::spawn(async move {
-            while let Ok(tx_data) = tx_receiver.recv().await {
-                match tx.send(Ok(tx_data)).await {
-                    Ok(_) => (),
-                    Err(_e) => {
-                        debug!("filtered stream client disconnected");
-                        break;
+            loop {
+                match tx_receiver.recv().await {
+                    Ok(tx_data) => match tx.send(Ok(tx_data)).await {
+                        Ok(_) => (),
+                        Err(_e) => {
+                            debug!("filtered stream client disconnected");
+                            break;
+                        }
+                    },
+                    Err(RecvError::Lagged(skipped)) => {
+                        warn!("filtered tx stream lagged, skipped {skipped} messages");
                     }
+                    Err(RecvError::Closed) => break,
                 }
             }
         });
