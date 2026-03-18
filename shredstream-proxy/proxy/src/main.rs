@@ -1,6 +1,6 @@
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::IpAddr,
     panic,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -27,6 +27,7 @@ use tokio::sync::broadcast::Sender as BroadcastSender;
 use crate::deshred::ShredsStateTracker;
 use crate::forwarder::ShredMetrics;
 use crate::multicast_config::create_multicast_socket_on_device;
+use crate::server::ServerEndpoint;
 
 mod deshred;
 mod forwarder;
@@ -63,9 +64,10 @@ struct Args {
     #[arg(long, env, default_value_t = 5_000)]
     metrics_report_interval_ms: u64,
 
-    /// GRPC port for serving decoded shreds as Solana entries (required)
+    /// GRPC endpoint for serving decoded shreds as Solana entries.
+    /// Format: PORT (e.g., 9999) for TCP, or "unix:PATH" (e.g., "unix:/tmp/shredstream.sock") for Unix socket.
     #[arg(long, env)]
-    grpc_service_port: u16,
+    grpc_service_endpoint: String,
 
     /// Number of threads to use. Defaults to use up to 4.
     #[arg(long, env)]
@@ -133,9 +135,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let entry_sender = Arc::new(BroadcastSender::new(4096));
     let filtered_tx_sender = Arc::new(BroadcastSender::new(4096));
 
+    // Parse gRPC endpoint
+    let grpc_endpoint = ServerEndpoint::parse(&args.grpc_service_endpoint)
+        .ok_or_else(|| format!("Invalid gRPC endpoint format: '{}'. Expected format: PORT (e.g., 9999), HOST:PORT (e.g., 0.0.0.0:9999), or unix:PATH (e.g., unix:/tmp/shredstream.sock)", args.grpc_service_endpoint))?;
+
     // Start gRPC server
     let server_hdl = server::start_server_thread(
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), args.grpc_service_port),
+        grpc_endpoint,
         entry_sender.clone(),
         filtered_tx_sender.clone(),
         exit.clone(),
@@ -321,8 +327,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     thread_handles.push(metrics_hdl);
 
     info!(
-        "Shredstream proxy started, listening on {}:{}/udp. gRPC server on port {}",
-        args.src_bind_addr, args.src_bind_port, args.grpc_service_port
+        "Shredstream proxy started, listening on {}:{}/udp. gRPC server on {}",
+        args.src_bind_addr, args.src_bind_port, args.grpc_service_endpoint
     );
 
     for thread in thread_handles {

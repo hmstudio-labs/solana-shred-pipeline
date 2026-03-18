@@ -2789,6 +2789,7 @@ dependencies = [
  "solana-streamer",
  "thiserror 2.0.12",
  "tokio",
+ "tokio-stream",
  "tonic 0.13.1",
 ]
 

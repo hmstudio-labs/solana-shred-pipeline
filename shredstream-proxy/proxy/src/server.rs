@@ -1,5 +1,6 @@
 use std::{
     net::SocketAddr,
+    path::Path,
     sync::{atomic::AtomicBool, Arc},
     thread::JoinHandle,
     time::Duration,
@@ -17,8 +18,51 @@ use jito_protos::{
     },
 };
 use log::{debug, warn};
+use tokio::net::UnixListener;
 use tokio::sync::broadcast::{error::RecvError, Receiver as BroadcastReceiver, Sender};
-use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
+
+// ======================================================
+// Server Endpoint Configuration
+// ======================================================
+#[derive(Debug, Clone)]
+pub enum ServerEndpoint {
+    Tcp(SocketAddr),
+    Unix(String),
+}
+
+impl ServerEndpoint {
+    /// Parse endpoint from string.
+    /// - "http://0.0.0.0:9999" or "9999" -> TCP
+    /// - "http://unix:/path/to.sock" or "unix:/path/to.sock" -> Unix socket
+    pub fn parse(s: &str) -> Option<Self> {
+        // Strip http:// prefix if present
+        let s = s.strip_prefix("http://").unwrap_or(s);
+
+        if let Some(path) = s.strip_prefix("unix:") {
+            Some(ServerEndpoint::Unix(path.to_string()))
+        } else {
+            // Try to parse as SocketAddr (e.g., "0.0.0.0:9999" or "[::]:9999")
+            // or as a port number only (e.g., "9999")
+            s.parse::<SocketAddr>()
+                .ok()
+                .or_else(|| {
+                    // If just a port number, use default address
+                    s.parse::<u16>()
+                        .ok()
+                        .map(|port| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port))
+                })
+                .map(ServerEndpoint::Tcp)
+        }
+    }
+
+    pub fn display(&self) -> String {
+        match self {
+            ServerEndpoint::Tcp(addr) => addr.to_string(),
+            ServerEndpoint::Unix(path) => format!("unix:{}", path),
+        }
+    }
+}
 
 // ======================================================
 // Shredstream Proxy Service
@@ -29,7 +73,7 @@ pub struct ShredstreamProxyService {
 }
 
 pub fn start_server_thread(
-    addr: SocketAddr,
+    endpoint: ServerEndpoint,
     entry_sender: Arc<Sender<PbEntry>>,
     filtered_tx_sender: Arc<Sender<TxData>>,
     exit: Arc<AtomicBool>,
@@ -39,17 +83,66 @@ pub fn start_server_thread(
         let runtime = tokio::runtime::Runtime::new().unwrap();
 
         let server_handle = runtime.spawn(async move {
-            log::info!("starting gRPC server on {:?}", addr);
-            tonic::transport::Server::builder()
-                .add_service(ShredstreamProxyServer::new(ShredstreamProxyService {
-                    entry_sender: entry_sender.clone(),
-                }))
-                .add_service(FilteredTxStreamServer::new(FilteredTxServiceImpl {
-                    filtered_tx_sender,
-                }))
-                .serve(addr)
-                .await
-                .unwrap();
+            log::info!("starting gRPC server on {}", endpoint.display());
+            let result = match &endpoint {
+                ServerEndpoint::Tcp(addr) => {
+                    tonic::transport::Server::builder()
+                        .add_service(ShredstreamProxyServer::new(ShredstreamProxyService {
+                            entry_sender: entry_sender.clone(),
+                        }))
+                        .add_service(FilteredTxStreamServer::new(FilteredTxServiceImpl {
+                            filtered_tx_sender,
+                        }))
+                        .serve(*addr)
+                        .await
+                }
+                ServerEndpoint::Unix(path) => {
+                    // Ensure parent directory exists
+                    if let Some(parent) = Path::new(path).parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            log::warn!("Failed to create socket directory {}: {}", parent.display(), e);
+                        }
+                    }
+                    // Remove existing socket file if present
+                    if let Err(e) = std::fs::remove_file(path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            log::debug!("Failed to remove existing socket file {}: {}", path, e);
+                        }
+                    }
+
+                    let listener = match UnixListener::bind(path) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            log::error!("Failed to bind Unix socket {}: {}", path, e);
+                            return Ok(());
+                        }
+                    };
+                    tonic::transport::Server::builder()
+                        .add_service(ShredstreamProxyServer::new(ShredstreamProxyService {
+                            entry_sender: entry_sender.clone(),
+                        }))
+                        .add_service(FilteredTxStreamServer::new(FilteredTxServiceImpl {
+                            filtered_tx_sender,
+                        }))
+                        .serve_with_incoming(UnixListenerStream::new(listener))
+                        .await
+                }
+            };
+
+            if let Err(e) = result {
+                log::error!("gRPC server error: {}", e);
+            }
+
+            // Clean up socket file on shutdown for Unix socket
+            if let ServerEndpoint::Unix(path) = &endpoint {
+                if let Err(e) = std::fs::remove_file(path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        log::debug!("Failed to clean up socket file {}: {}", path, e);
+                    }
+                }
+            }
+
+            Ok::<(), tonic::transport::Error>(())
         });
 
         while !exit.load(std::sync::atomic::Ordering::Relaxed) {

@@ -40,6 +40,7 @@ solana-sdk = "=2.2.1"
 solana-streamer = "=2.2.1"
 thiserror = "2"
 tokio = "1"
+tokio-stream = "0.1"
 tonic = { version = "0.13", features = ["tls-webpki-roots"] }
 tonic-build = "0.13"
 

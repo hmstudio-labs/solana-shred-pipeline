@@ -2,9 +2,29 @@ use jito_protos::shredstream::{
     shredstream_proxy_client::ShredstreamProxyClient, SubscribeEntriesRequest,
 };
 
+/// Prepares endpoint string for tonic client connection.
+/// - TCP endpoints: adds "http://" prefix if needed
+/// - Unix socket endpoints: expects "unix:/path/to.sock" format
+fn prepare_endpoint(endpoint: String) -> String {
+    // Unix sockets don't need http:// prefix
+    if endpoint.starts_with("unix:") {
+        endpoint
+    } else if endpoint.starts_with("http://") {
+        endpoint
+    } else {
+        format!("http://{}", endpoint)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
-    let mut client = ShredstreamProxyClient::connect("http://127.0.0.1:9999")
+    // Configure endpoint: use same format as server --grpc-service-endpoint
+    let endpoint = std::env::var("GRPC_ENDPOINT")
+        .unwrap_or_else(|_| "127.0.0.1:9999".to_string());
+
+    let endpoint = prepare_endpoint(endpoint);
+
+    let mut client = ShredstreamProxyClient::connect(endpoint)
         .await
         .unwrap();
     let mut stream = client
